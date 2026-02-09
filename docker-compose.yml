@@ -1,0 +1,130 @@
+version: '3.8'
+
+# ===================================================
+# Complete Docker Setup for Todo SaaS Platform
+# ===================================================
+# This docker-compose file sets up:
+# 1. PostgreSQL - Primary database
+# 2. pgAdmin - Database management UI
+# 3. Keycloak - Identity & Access Management
+# 4. Prefect - Workflow Orchestration
+#
+# All services are connected via 'todo_network'
+# Your Django (on Mac) connects to these services via localhost
+# ===================================================
+
+services:
+  # ===================================================
+  # PostgreSQL Database
+  # ===================================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: todo_postgres
+    environment:
+      POSTGRES_DB: todo_saas_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db.sql:/docker-entrypoint-initdb.d
+    networks:
+      - todo_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ===================================================
+  # pgAdmin - PostgreSQL Management UI
+  # ===================================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: todo_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin_password
+    ports:
+      - "5050:80"
+    networks:
+      - todo_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+
+  # ===================================================
+  # Keycloak - Identity & Access Management
+  # ===================================================
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.1.0
+    container_name: todo_keycloak
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak_db
+      KC_DB_USERNAME: postgres
+      KC_DB_PASSWORD: postgres
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_FEATURES: preview
+      KC_PROXY: edge
+      KC_HOSTNAME_STRICT: false
+      KC_HOSTNAME_STRICT_HTTPS: false
+      KC_HTTP_ENABLED: true
+      KC_LOG_LEVEL: INFO
+    ports:
+      - "8080:8080"
+    networks:
+      - todo_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command:
+      - start-dev
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+  # ===================================================
+  # Prefect Server - Workflow Orchestration
+  # ===================================================
+  prefect:
+    image: prefecthq/prefect:3-latest
+    container_name: todo_prefect
+    environment:
+      PREFECT_API_URL: http://0.0.0.0:4200/api
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+      PREFECT_SERVER_API_PORT: 4200
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://postgres:postgres@postgres:5432/prefect_db
+      PREFECT_LOGGING_LEVEL: INFO
+    ports:
+      - "4200:4200"
+    networks:
+      - todo_network
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    command: prefect server start --host 0.0.0.0 --port 4200
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4200/api/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+
+networks:
+  todo_network:
+    driver: bridge
+    name: todo_network
+
+volumes:
+  postgres_data:
+  pgadmin_data:

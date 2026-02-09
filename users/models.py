@@ -8,8 +8,7 @@ class User(AbstractUser):
     No tenant-specific data here.
     """
 
-    # You can later switch to email login if needed
-    # email = models.EmailField(unique=True)
+    keycloak_id = models.CharField(max_length=255, null=True, blank=True, unique=True)
 
     def __str__(self):
         return self.username

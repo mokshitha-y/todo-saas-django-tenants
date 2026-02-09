@@ -1,11 +1,38 @@
 from django.db import models
 from users.models import User
+from simple_history.models import HistoricalRecords
 
 
 class Todo(models.Model):
+    RECURRENCE_CHOICES = (
+        ("NONE", "No Recurrence"),
+        ("DAILY", "Daily"),
+        ("WEEKLY", "Weekly"),
+        ("MONTHLY", "Monthly"),
+    )
+
     title = models.CharField(max_length=255)
     description = models.TextField(blank=True)
     is_completed = models.BooleanField(default=False)
+    is_deleted = models.BooleanField(default=False)
+    due_date = models.DateTimeField(null=True, blank=True)
+    
+    # Recurring todo fields
+    recurrence_type = models.CharField(
+        max_length=10,
+        choices=RECURRENCE_CHOICES,
+        default="NONE",
+    )
+    parent_todo = models.ForeignKey(
+        "self",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="recurring_instances",
+        help_text="Reference to the original recurring todo"
+    )
+    
+    history = HistoricalRecords()
 
     created_by = models.ForeignKey(
         User,
@@ -22,6 +49,7 @@ class Todo(models.Model):
     )
 
     created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]

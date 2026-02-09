@@ -17,10 +17,30 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    const wasLoggedIn = localStorage.getItem("access");
+    
     if (error.response?.status === 401) {
       localStorage.clear();
+      
+      if (wasLoggedIn) {
+        alert("Your session has ended. This may be because your role was changed by an administrator. Please log in again.");
+      }
+      
       window.location.href = "/login";
     }
+    
+    // Handle 403 - role changed or permissions revoked
+    if (error.response?.status === 403 && wasLoggedIn) {
+      const errorMsg = error.response?.data?.detail || error.response?.data?.error || "";
+      
+      // Check if it's a role/permission related 403
+      if (errorMsg.includes("cannot") || errorMsg.includes("not") || errorMsg.includes("permission")) {
+        localStorage.clear();
+        alert("Your permissions have changed. This may be because your role was updated by an administrator. Please log in again.");
+        window.location.href = "/login";
+      }
+    }
+    
     return Promise.reject(error);
   }
 );

@@ -1,0 +1,9 @@
+django<5.0
+djangorestframework
+django-tenants
+django-cors-headers
+djangorestframework-simplejwt
+psycopg2-binary
+python-keycloak
+prefect
+django-simple-history

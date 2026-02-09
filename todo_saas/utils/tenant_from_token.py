@@ -46,6 +46,9 @@ class TenantFromTokenMiddleware(MiddlewareMixin):
         try:
             tenant = Tenant.objects.get(schema_name=tenant_schema)
             connection.set_tenant(tenant)
+            
+            # ✅ ATTACH TENANT TO REQUEST (IMPORTANT FOR VIEWS)
+            request.tenant = tenant
         except Tenant.DoesNotExist:
             connection.set_schema_to_public()
             return

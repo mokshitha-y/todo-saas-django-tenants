@@ -9,4 +9,6 @@ urlpatterns = [
 
     # Tenant todos ✅
     path("api/todos/", include("todos.urls")),
+    path("api/customers/", include("customers.urls")),
+
 ]

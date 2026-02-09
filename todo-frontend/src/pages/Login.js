@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react"; // ⭐ added useEffect
 import { useNavigate } from "react-router-dom";
 import api from "../api/axios";
 
@@ -6,71 +6,145 @@ function Login() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
+  const [tenantOptions, setTenantOptions] = useState([]);
+  const [showTenantModal, setShowTenantModal] = useState(false);
+  const [loginResponse, setLoginResponse] = useState(null);
+
   const navigate = useNavigate();
+
+  // ⭐ Force clear fields on mount (prevents autofill restore)
+  useEffect(() => {
+    setUsername("");
+    setPassword("");
+  }, []);
 
   const handleLogin = async (e) => {
     e.preventDefault();
     setError("");
 
     try {
-      const res = await api.post("auth/login/", {
-        username,
-        password,
+      const res = await api.post("auth/login/", { username, password });
+
+      if (Array.isArray(res.data.tenants) && res.data.tenants.length > 1) {
+        setTenantOptions(res.data.tenants);
+        setLoginResponse(res.data);
+        setShowTenantModal(true);
+        return;
+      }
+
+      const tenant =
+        res.data.tenant || (res.data.tenants && res.data.tenants[0]);
+
+      localStorage.setItem("access", res.data.access);
+      localStorage.setItem("refresh", res.data.refresh);
+      localStorage.setItem("role", res.data.user.role);
+      localStorage.setItem("email", res.data.user.email);
+      localStorage.setItem("username", res.data.user.username); // Ensure username is always set
+      localStorage.setItem("tenant", tenant.schema);
+      localStorage.setItem(
+        "tenants",
+        JSON.stringify(res.data.tenants || [tenant])
+      );
+
+      // ⭐ Clear fields after login
+      setUsername("");
+      setPassword("");
+
+      navigate("/todos");
+    } catch (err) {
+      const msg = err.response?.data?.error || "Invalid username/email or password";
+      setError(msg);
+    }
+  };
+
+  const handleTenantSelect = async (tenant) => {
+    setShowTenantModal(false);
+
+    try {
+      const res = await api.post("auth/switch-tenant/", {
+        tenant_schema: tenant.schema,
+        refresh: loginResponse.refresh,
       });
 
-      // ✅ store auth context
       localStorage.setItem("access", res.data.access);
       localStorage.setItem("refresh", res.data.refresh);
       localStorage.setItem("role", res.data.user.role);
       localStorage.setItem("username", res.data.user.username);
-      localStorage.setItem("tenant", res.data.tenant.schema);
+      localStorage.setItem("tenant", tenant.schema);
 
-      // ✅ STAY ON SAME DOMAIN
+      if (res.data.tenants) {
+        localStorage.setItem("tenants", JSON.stringify(res.data.tenants));
+      }
+
       navigate("/todos");
-    } catch (err) {
-      setError("Invalid username or password");
+    } catch {
+      setError("Failed to switch tenant. Please try again.");
     }
   };
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-100">
-      <form
-        onSubmit={handleLogin}
-        className="bg-white p-6 rounded-lg shadow-md w-80"
-      >
-        <h2 className="text-xl font-semibold mb-4 text-center">
-          Login to Todo SaaS
-        </h2>
+      {showTenantModal && (
+        <div className="fixed inset-0 flex items-center justify-center bg-black bg-opacity-40 z-50">
+          <div className="bg-white p-6 rounded-lg shadow-lg w-96">
+            <h3 className="text-lg font-semibold mb-4 text-center">
+              Select a Tenant
+            </h3>
+            <ul className="mb-4">
+              {tenantOptions.map((tenant) => (
+                <li key={tenant.schema} className="mb-2">
+                  <button
+                    className="w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600"
+                    onClick={() => handleTenantSelect(tenant)}
+                  >
+                    {tenant.name || tenant.schema}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
 
-        <input
-          className="w-full mb-3 px-3 py-2 border rounded"
-          placeholder="Username"
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          required
-        />
+      <div className="bg-white p-6 rounded shadow w-96">
+        {/* ⭐ autoComplete trick to defeat browser autofill */}
+        <form onSubmit={handleLogin} autoComplete="new-password">
+          <input
+            type="text"
+            name="login-username"
+            placeholder="Username or email"
+            className="w-full mb-1 p-2 border rounded"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoComplete="new-password"
+          />
+          <div className="text-xs text-gray-500 mb-3">You can login with your username or the email you were invited with.</div>
 
-        <input
-          type="password"
-          className="w-full mb-3 px-3 py-2 border rounded"
-          placeholder="Password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          required
-        />
+          <input
+            type="password"
+            name="login-password" // ⭐ unique name
+            placeholder="Password"
+            className="w-full mb-3 p-2 border rounded"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoComplete="new-password"
+          />
 
-        {error && (
-          <p className="text-red-500 text-sm mb-3 text-center">{error}</p>
-        )}
+          <button
+            type="submit"
+            className="w-full bg-blue-500 text-white py-2 rounded hover:bg-blue-600"
+          >
+            Login
+          </button>
 
-        <button
-          type="submit"
-          className="w-full bg-blue-600 text-white py-2 rounded hover:bg-blue-700 transition"
-        >
-          Login
-        </button>
+          {error && (
+            <div className="text-red-500 text-sm mt-2 text-center">
+              {error}
+            </div>
+          )}
+        </form>
 
-        <p className="text-sm text-center mt-4">
+        <p className="mt-4 text-center">
           New here?{" "}
           <span
             className="text-blue-600 cursor-pointer hover:underline"
@@ -79,7 +153,15 @@ function Login() {
             Create an account
           </span>
         </p>
-      </form>
+        <p className="mt-2 text-center">
+          <span
+            className="text-blue-600 cursor-pointer hover:underline text-sm"
+            onClick={() => navigate("/reset-password")}
+          >
+            Forgot Password?
+          </span>
+        </p>
+      </div>
     </div>
   );
 }
