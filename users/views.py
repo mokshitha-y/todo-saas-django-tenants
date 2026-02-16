@@ -57,21 +57,53 @@ class RegisterView(APIView):
         kc_user_id = None
         kc_client_id = None
 
+        # Normalize email for checks
+        email_lower = email.strip().lower()
+
         try:
+            # Check username in Keycloak and Django first
             existing_kc_user = keycloak.get_user_by_username(username)
             logger.info("Keycloak user lookup for username=%s returned=%s", username, bool(existing_kc_user))
-            # Double-check username equality to avoid false positives
             if existing_kc_user and existing_kc_user.get("username") == username:
                 return Response(
                     {"error": "Username already exists"},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            # Also check local DB for username collisions
             if User.objects.filter(username=username).exists():
                 logger.info("Local DB: username %s already exists", username)
                 return Response({"error": "Username already exists"}, status=status.HTTP_400_BAD_REQUEST)
 
+            # Check email in Keycloak and Django before attempting create (avoid misleading "email exists" on other failures)
+            existing_by_email_kc = keycloak.get_user_by_email(email_lower)
+            if existing_by_email_kc:
+                logger.info("Keycloak: user with email %s already exists", email_lower)
+                return Response(
+                    {"error": "User with this email already exists"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if User.objects.filter(email__iexact=email_lower).exists():
+                logger.info("Local DB: email %s already exists", email_lower)
+                return Response(
+                    {"error": "User with this email already exists"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             kc_user_id = keycloak.get_or_create_user(username, email, password)
+
+            if not kc_user_id:
+                # Only show "email already exists" if we can confirm email is taken; else generic failure
+                existing_now = keycloak.get_user_by_email(email_lower)
+                if existing_now:
+                    return Response(
+                        {"error": "User with this email already exists"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                logger.error("Failed to create Keycloak user for username=%s email=%s", username, email)
+                return Response(
+                    {"error": "Account creation failed. Try a different username or email, or check Keycloak is reachable."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            
             # Always use a unique domain for Keycloak org to avoid conflicts
             import uuid
             unique_suffix = str(uuid.uuid4())[:8]
@@ -250,6 +282,10 @@ class LoginView(APIView):
         # Try ROPC: prefer global (confidential) client first — it has proper scopes
         token_resp = keycloak.exchange_password_for_token(username, password)
 
+        # If realm has "Email as username", Keycloak may expect email in the username param; try with email
+        if not token_resp and user_obj and getattr(user_obj, "email", None) and user_obj.email != username:
+            token_resp = keycloak.exchange_password_for_token(user_obj.email, password)
+
         if not token_resp:
             return Response({"error": "Invalid username/email or password"}, status=401)
 
@@ -305,21 +341,35 @@ class LoginView(APIView):
             # No local mapping exists, deny access (tenant membership missing)
             return Response({"error": "No tenant access"}, status=403)
 
-        memberships = TenantUser.objects.filter(user=user)
+        memberships = TenantUser.objects.filter(user=user).select_related("tenant")
         if not memberships.exists():
             return Response({"error": "No tenant access"}, status=403)
 
-        membership = (
-            memberships.filter(tenant__schema_name=tenant_schema).first()
-            if tenant_schema
-            else memberships.first()
-        )
+        if tenant_schema:
+            membership = memberships.filter(tenant__schema_name=tenant_schema).first()
+        else:
+            # Default: prefer company org (non-personal) so members land there first
+            from customers.services import PERSONAL_SCHEMA_PREFIX
+            non_personal = [m for m in memberships if not m.tenant.schema_name.startswith(PERSONAL_SCHEMA_PREFIX)]
+            membership = (non_personal[0] if non_personal else memberships.first())
 
         tokens = get_tokens_for_user(
             user,
             membership.tenant,
             membership.role,
         )
+
+        from customers.services import PERSONAL_SCHEMA_PREFIX
+        all_memberships = TenantUser.objects.filter(user=user).select_related("tenant")
+        tenants = [
+            {
+                "schema": m.tenant.schema_name,
+                "name": m.tenant.name,
+                "role": m.role,
+                "is_personal": m.tenant.schema_name.startswith(PERSONAL_SCHEMA_PREFIX),
+            }
+            for m in all_memberships
+        ]
 
         return Response(
             {
@@ -329,10 +379,57 @@ class LoginView(APIView):
                     "schema": membership.tenant.schema_name,
                     "name": membership.tenant.name,
                 },
+                "tenants": tenants,
                 "keycloak": {"access_token": access_token, "id_token": token_resp.get("id_token")},
             },
             status=status.HTTP_200_OK,
         )
+
+# =========================
+# TENANTS LIST & SWITCH (for multi-tenant / personal org)
+# =========================
+
+class ListMyTenantsView(APIView):
+    """Return all tenants (organisations) the current user belongs to."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from customers.services import PERSONAL_SCHEMA_PREFIX
+
+        memberships = TenantUser.objects.filter(user=request.user).select_related("tenant")
+        tenants = []
+        for m in memberships:
+            schema = m.tenant.schema_name
+            tenants.append({
+                "schema": schema,
+                "name": m.tenant.name,
+                "role": m.role,
+                "is_personal": schema.startswith(PERSONAL_SCHEMA_PREFIX),
+            })
+        return Response({"tenants": tenants})
+
+
+class SwitchTenantView(APIView):
+    """Return new JWT for the given tenant_schema so the user can act in that org."""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        tenant_schema = request.data.get("tenant_schema")
+        if not tenant_schema:
+            return Response({"error": "tenant_schema required"}, status=400)
+        membership = TenantUser.objects.filter(
+            user=request.user,
+            tenant__schema_name=tenant_schema,
+        ).select_related("tenant").first()
+        if not membership:
+            return Response({"error": "Not a member of this organisation"}, status=403)
+        tokens = get_tokens_for_user(request.user, membership.tenant, membership.role)
+        return Response({
+            **tokens,
+            "user": {"username": request.user.username, "role": membership.role},
+            "tenant": {"schema": membership.tenant.schema_name, "name": membership.tenant.name},
+        })
+
 
 # =========================
 # INVITE USER

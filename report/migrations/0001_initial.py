@@ -1,7 +1,6 @@
 # Generated migration for DashboardMetrics model
 
 from django.db import migrations, models
-import django.db.models.deletion
 
 
 class Migration(migrations.Migration):
@@ -9,7 +8,6 @@ class Migration(migrations.Migration):
     initial = True
 
     dependencies = [
-        ('customers', '0003_organization_role_client_keycloak_id_and_more'),
     ]
 
     operations = [
@@ -20,8 +18,37 @@ class Migration(migrations.Migration):
                 ('total_users', models.IntegerField(default=0)),
                 ('todos_new', models.IntegerField(default=0)),
                 ('todos_completed', models.IntegerField(default=0)),
+                ('todos_deleted', models.IntegerField(default=0)),
+                ('total_todos', models.IntegerField(default=0)),
                 ('updated_at', models.DateTimeField(auto_now=True)),
-                ('tenant', models.OneToOneField(on_delete=django.db.models.deletion.CASCADE, related_name='metrics', to='customers.client')),
             ],
+            options={
+                'verbose_name_plural': 'Dashboard Metrics',
+            },
+        ),
+        migrations.CreateModel(
+            name='OrchestrationLog',
+            fields=[
+                ('id', models.BigAutoField(auto_created=True, primary_key=True, serialize=False, verbose_name='ID')),
+                ('flow_name', models.CharField(choices=[('DASHBOARD_AGGREGATION', 'Dashboard Aggregation'), ('RECURRING_TODO', 'Recurring Todo Processing'), ('TENANT_REGISTRATION', 'Tenant Registration')], max_length=50)),
+                ('status', models.CharField(choices=[('STARTED', 'Started'), ('COMPLETED', 'Completed'), ('FAILED', 'Failed')], max_length=20)),
+                ('flow_run_id', models.CharField(blank=True, max_length=100, null=True)),
+                ('triggered_by', models.CharField(blank=True, max_length=100, null=True)),
+                ('details', models.JSONField(blank=True, null=True)),
+                ('error_message', models.TextField(blank=True, null=True)),
+                ('started_at', models.DateTimeField()),
+                ('completed_at', models.DateTimeField(blank=True, null=True)),
+            ],
+            options={
+                'ordering': ['-started_at'],
+            },
+        ),
+        migrations.AddIndex(
+            model_name='orchestrationlog',
+            index=models.Index(fields=['flow_name'], name='report_orch_flow_na_6ccc89_idx'),
+        ),
+        migrations.AddIndex(
+            model_name='orchestrationlog',
+            index=models.Index(fields=['started_at'], name='report_orch_started_88a845_idx'),
         ),
     ]

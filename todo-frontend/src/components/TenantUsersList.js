@@ -29,7 +29,7 @@ function TenantUsersList({ refreshKey = 0 }) {
   }, [refreshKey]);
 
   const handleRemoveUser = async (user) => {
-    if (!window.confirm(`Remove ${user.username} from this organization? They will lose access immediately.`)) {
+    if (!window.confirm(`Remove ${user.username} from this organization? Their account will be disabled and they will lose access immediately.`)) {
       return;
     }
 
@@ -38,8 +38,8 @@ function TenantUsersList({ refreshKey = 0 }) {
     setError("");
 
     try {
-      const result = await removeUserFromTenant(user.id);
-      setMessage(`${user.username} has been removed. ${result.keycloak_tokens_revoked ? "Access revoked." : ""}`);
+      await removeUserFromTenant(user.id);
+      setMessage(`${user.username} has been removed and their account has been disabled.`);
       // Refresh the list
       await loadUsers();
     } catch (err) {

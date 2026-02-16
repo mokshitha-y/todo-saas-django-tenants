@@ -25,31 +25,28 @@ function Login() {
     try {
       const res = await api.post("auth/login/", { username, password });
 
-      if (Array.isArray(res.data.tenants) && res.data.tenants.length > 1) {
-        setTenantOptions(res.data.tenants);
+      const tenant =
+        res.data.tenant || (Array.isArray(res.data.tenants) && res.data.tenants[0]);
+      const tenantsList = res.data.tenants || (tenant ? [tenant] : []);
+
+      // Always save tokens (for default tenant) so switch-tenant can be called when needed
+      localStorage.setItem("access", res.data.access);
+      localStorage.setItem("refresh", res.data.refresh);
+      localStorage.setItem("role", res.data.user?.role || "");
+      localStorage.setItem("email", res.data.user?.email || "");
+      localStorage.setItem("username", res.data.user?.username || "");
+      localStorage.setItem("tenant", tenant?.schema || "");
+      localStorage.setItem("tenants", JSON.stringify(tenantsList));
+
+      if (Array.isArray(tenantsList) && tenantsList.length > 1) {
+        setTenantOptions(tenantsList);
         setLoginResponse(res.data);
         setShowTenantModal(true);
         return;
       }
 
-      const tenant =
-        res.data.tenant || (res.data.tenants && res.data.tenants[0]);
-
-      localStorage.setItem("access", res.data.access);
-      localStorage.setItem("refresh", res.data.refresh);
-      localStorage.setItem("role", res.data.user.role);
-      localStorage.setItem("email", res.data.user.email);
-      localStorage.setItem("username", res.data.user.username); // Ensure username is always set
-      localStorage.setItem("tenant", tenant.schema);
-      localStorage.setItem(
-        "tenants",
-        JSON.stringify(res.data.tenants || [tenant])
-      );
-
-      // ⭐ Clear fields after login
       setUsername("");
       setPassword("");
-
       navigate("/todos");
     } catch (err) {
       const msg = err.response?.data?.error || "Invalid username/email or password";
@@ -57,28 +54,29 @@ function Login() {
     }
   };
 
-  const handleTenantSelect = async (tenant) => {
+  const handleTenantSelect = async (selectedTenant) => {
     setShowTenantModal(false);
+
+    const currentSchema = loginResponse?.tenant?.schema;
+    if (selectedTenant.schema === currentSchema) {
+      navigate("/todos");
+      return;
+    }
 
     try {
       const res = await api.post("auth/switch-tenant/", {
-        tenant_schema: tenant.schema,
-        refresh: loginResponse.refresh,
+        tenant_schema: selectedTenant.schema,
       });
 
       localStorage.setItem("access", res.data.access);
       localStorage.setItem("refresh", res.data.refresh);
-      localStorage.setItem("role", res.data.user.role);
-      localStorage.setItem("username", res.data.user.username);
-      localStorage.setItem("tenant", tenant.schema);
-
-      if (res.data.tenants) {
-        localStorage.setItem("tenants", JSON.stringify(res.data.tenants));
-      }
+      localStorage.setItem("role", res.data.user?.role || "");
+      localStorage.setItem("username", res.data.user?.username || "");
+      localStorage.setItem("tenant", res.data.tenant?.schema || "");
 
       navigate("/todos");
     } catch {
-      setError("Failed to switch tenant. Please try again.");
+      setError("Failed to switch organisation. Please try again.");
     }
   };
 

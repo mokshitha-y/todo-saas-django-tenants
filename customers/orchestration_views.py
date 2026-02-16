@@ -30,6 +30,8 @@ class DashboardMetricsView(APIView):
     
     GET /api/dashboard/metrics/
     
+    Metrics are stored per-tenant in each schema's report_dashboardmetrics table.
+    
     Returns:
         {
             "schema_name": "customer1",
@@ -47,7 +49,7 @@ class DashboardMetricsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        """Fetch cached dashboard metrics and include current user's role."""
+        """Fetch cached dashboard metrics from tenant schema and include current user's role."""
         try:
             tenant = getattr(request, "tenant", None)
             if not tenant:
@@ -55,7 +57,8 @@ class DashboardMetricsView(APIView):
                     {"error": "No tenant context found"},
                     status=status.HTTP_400_BAD_REQUEST
                 )
-            # Get current user's role
+            
+            # Get current user's role and user counts from public schema
             with schema_context("public"):
                 try:
                     membership = TenantUser.objects.get(user=request.user, tenant=tenant)
@@ -66,12 +69,17 @@ class DashboardMetricsView(APIView):
                 member_count = TenantUser.objects.filter(tenant=tenant, role="MEMBER").count()
                 viewer_count = TenantUser.objects.filter(tenant=tenant, role="VIEWER").count()
                 total_users = TenantUser.objects.filter(tenant=tenant).count()
-                metrics = DashboardMetrics.objects.filter(tenant=tenant).first()
+            
+            # Get metrics from tenant schema (no FK needed - schema IS the tenant)
+            with schema_context(tenant.schema_name):
+                metrics = DashboardMetrics.objects.first()
+            
             if not metrics:
                 return Response({
                     "schema_name": tenant.schema_name,
                     "new_todos": 0,
                     "completed_todos": 0,
+                    "deleted_todos": 0,
                     "total_todos": 0,
                     "total_users": total_users,
                     "owners": owner_count,
@@ -81,11 +89,13 @@ class DashboardMetricsView(APIView):
                     "role": current_role,
                     "message": "Metrics not yet aggregated. Click 'Refresh Metrics' to compute now.",
                 }, status=status.HTTP_200_OK)
+            
             return Response({
                 "schema_name": tenant.schema_name,
                 "new_todos": metrics.todos_new,
                 "completed_todos": metrics.todos_completed,
-                "total_todos": metrics.todos_new + metrics.todos_completed,
+                "deleted_todos": metrics.todos_deleted,
+                "total_todos": metrics.total_todos,
                 "total_users": total_users,
                 "owners": owner_count,
                 "members": member_count,
@@ -145,7 +155,7 @@ class TriggerDashboardAggregationView(APIView):
 
             # Call the Prefect @flow directly — this creates a tracked flow run
             # in Prefect dashboard AND executes immediately (no worker needed).
-            result = dashboard_aggregation_flow()
+            result = dashboard_aggregation_flow(triggered_by=request.user.username)
             logger.info(f"Dashboard aggregation flow triggered by {request.user.username}: {result}")
 
             return Response({
@@ -232,7 +242,10 @@ class DeleteAccountView(APIView):
                     f"by user {request.user.username}"
                 )
 
-                result = account_deletion_flow(tenant_id)
+                result = account_deletion_flow(
+                    tenant_id=tenant_id,
+                    triggered_by=request.user.username
+                )
 
                 if result.get("success"):
                     return Response({

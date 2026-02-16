@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import api from "../api/axios";
 import { useNavigate } from "react-router-dom";
 import TenantUsersList from "../components/TenantUsersList";
@@ -15,6 +15,8 @@ function Dashboard() {
   const [metrics, setMetrics] = useState(null);
   const [error, setError] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [tenants, setTenants] = useState([]);
+  const [switchingTenant, setSwitchingTenant] = useState(false);
 
   const [showTeamManagement, setShowTeamManagement] = useState(false);
 
@@ -25,6 +27,7 @@ function Dashboard() {
   const [teamRefreshKey, setTeamRefreshKey] = useState(0);
 
   const isOwner = metrics?.role === "OWNER";
+  const currentSchema = metrics?.schema_name || localStorage.getItem("tenant");
 
   // ===================== FETCH METRICS =====================
   const fetchMetrics = async () => {
@@ -38,9 +41,39 @@ function Dashboard() {
     }
   };
 
+  const fetchTenants = useCallback(async () => {
+    try {
+      const res = await api.get("auth/tenants/");
+      setTenants(res.data.tenants || []);
+    } catch {
+      setTenants([]);
+    }
+  }, []);
+
   useEffect(() => {
     fetchMetrics();
-  }, []);
+    fetchTenants();
+  }, [fetchTenants]);
+
+  const handleSwitchTenant = async (tenantSchema) => {
+    if (tenantSchema === currentSchema) return;
+    setSwitchingTenant(true);
+    setError(null);
+    try {
+      const res = await api.post("auth/switch-tenant/", { tenant_schema: tenantSchema });
+      localStorage.setItem("access", res.data.access);
+      localStorage.setItem("refresh", res.data.refresh);
+      localStorage.setItem("tenant", res.data.tenant.schema);
+      localStorage.setItem("role", res.data.user?.role || "");
+      setMetrics((prev) => prev ? { ...prev, schema_name: res.data.tenant.schema, name: res.data.tenant.name, role: res.data.user?.role } : null);
+      await fetchMetrics();
+      await fetchTenants();
+    } catch (err) {
+      setError(err.response?.data?.error || "Failed to switch organisation");
+    } finally {
+      setSwitchingTenant(false);
+    }
+  };
 
   // ===================== MANUAL AGGREGATION =====================
   const handleManualAggregation = async () => {
@@ -116,10 +149,31 @@ function Dashboard() {
       <div className="flex flex-col md:flex-row md:justify-between md:items-center mb-6">
         <div>
           <h1 className="text-3xl font-bold text-gray-800 mb-1">Dashboard</h1>
-          <p className="text-gray-600">Organization: {metrics?.schema_name || "-"}</p>
+          <div className="flex flex-wrap items-center gap-2 mt-1">
+            <span className="text-gray-600">
+              Organisation:{" "}
+              {tenants.length > 1 ? (
+                <select
+                  value={currentSchema || ""}
+                  onChange={(e) => handleSwitchTenant(e.target.value)}
+                  disabled={switchingTenant}
+                  className="ml-1 border rounded px-2 py-1 bg-white text-gray-800 font-medium"
+                >
+                  {tenants.map((t) => (
+                    <option key={t.schema} value={t.schema}>
+                      {t.is_personal ? t.name : t.name}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                (tenants[0]?.name || metrics?.schema_name || "-")
+              )}
+            </span>
+            {switchingTenant && <span className="text-sm text-gray-500">Switching…</span>}
+          </div>
           <p className="text-xs text-gray-400 mt-1">Current role: {metrics?.role || "-"}</p>
         </div>
-        <div className="flex gap-3 mt-4 md:mt-0">
+        <div className="flex gap-3 mt-4 md:mt-0 flex-wrap">
           <button
             onClick={handleManualAggregation}
             disabled={refreshing}

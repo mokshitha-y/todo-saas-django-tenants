@@ -166,6 +166,7 @@ class RemoveUserFromTenantView(APIView):
             # 2. Remove from Keycloak organization members
             try:
                 kc_service.remove_user_from_organization(kc_uid, tenant.name)
+                logger.info(f"Removed {user_to_remove.username} from KC org {tenant.name}")
             except Exception as e:
                 logger.warning(f"Failed to remove user from organization in Keycloak: {e}")
 
@@ -183,6 +184,15 @@ class RemoveUserFromTenantView(APIView):
             except Exception as e:
                 logger.warning(f"Failed to remove user from group in Keycloak: {e}")
 
+            # 5. ALWAYS disable user in Keycloak (removed members should not
+            #    be able to log in regardless of other tenant memberships)
+            try:
+                kc_service.disable_user(kc_uid)
+                keycloak_disabled = True
+                logger.info(f"Disabled {user_to_remove.username} in Keycloak")
+            except Exception as e:
+                logger.warning(f"Failed to disable user in Keycloak: {e}")
+
         # ---- Local DB Cleanup ----
         # Remove from TenantUser
         target_membership.delete()
@@ -191,36 +201,37 @@ class RemoveUserFromTenantView(APIView):
         # Remove from RolesMap
         RolesMap.objects.filter(user=user_to_remove, tenant=tenant).delete()
 
-        # Check if user has other tenants
-        other_tenants = TenantUser.objects.filter(user=user_to_remove).count()
+        # Cancel any pending invitations for this user in this tenant
+        from customers.models import Invitation
+        cancelled_invitations = Invitation.objects.filter(
+            email=user_to_remove.email,
+            tenant=tenant,
+            status="PENDING"
+        ).update(status="CANCELLED")
+        if cancelled_invitations:
+            logger.info(f"Cancelled {cancelled_invitations} pending invitation(s) for {user_to_remove.email}")
 
-        # Only if user has NO other tenants: disable in KC + deactivate locally
+        # Deactivate in local database (disabled user cannot log in)
         database_deactivated = False
-        if other_tenants == 0:
-            if kc_uid:
-                try:
-                    kc_service.disable_user(kc_uid)
-                    keycloak_disabled = True
-                    logger.info(f"Disabled {user_to_remove.username} in Keycloak (orphaned, 0 tenants)")
-                except Exception as e:
-                    logger.warning(f"Failed to disable user in Keycloak: {e}")
-            try:
-                user_to_remove.is_active = False
-                user_to_remove.save(update_fields=["is_active"])
-                database_deactivated = True
-                logger.info(f"Deactivated user {user_to_remove.username} in local database")
-            except Exception as e:
-                logger.warning(f"Failed to deactivate user in database: {e}")
+        try:
+            user_to_remove.is_active = False
+            user_to_remove.save(update_fields=["is_active"])
+            database_deactivated = True
+            logger.info(f"Deactivated user {user_to_remove.username} in local database")
+        except Exception as e:
+            logger.warning(f"Failed to deactivate user in database: {e}")
+
+        remaining_tenants = TenantUser.objects.filter(user=user_to_remove).count()
 
         return Response({
-            "message": f"User removed from tenant" + (" and account disabled" if database_deactivated else ""),
+            "message": f"User removed from organization and account disabled",
             "user_id": user_id,
             "username": user_to_remove.username,
             "removed_role": removed_role,
             "keycloak_tokens_revoked": keycloak_revoked,
             "keycloak_user_disabled": keycloak_disabled,
             "database_user_deactivated": database_deactivated,
-            "remaining_tenants": other_tenants,
+            "remaining_tenants": remaining_tenants,
         }, status=status.HTTP_200_OK)
 
 

@@ -5,6 +5,7 @@ import Signup from "./pages/Signup";
 import Dashboard from "./pages/Dashboard";
 import ResetPassword from "./pages/ResetPassword";
 import ChangePassword from "./pages/ChangePassword";
+import AcceptInvitation from "./pages/AcceptInvitation";
 import PrivateRoute from "./components/PrivateRoute";
 
 function App() {
@@ -16,6 +17,7 @@ function App() {
         <Route path="/login" element={<Login />} />
         <Route path="/signup" element={<Signup />} />
         <Route path="/reset-password" element={<ResetPassword />} />
+        <Route path="/accept-invitation/:token" element={<AcceptInvitation />} />
 
         <Route
           path="/change-password"

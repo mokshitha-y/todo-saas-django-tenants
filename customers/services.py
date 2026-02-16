@@ -1,10 +1,17 @@
 
 import logging
+import uuid as uuid_module
 from django.conf import settings
+from django.db import transaction
+from django_tenants.utils import schema_context
 from keycloak import KeycloakAdmin
 import requests
 
 logger = logging.getLogger(__name__)
+
+# Prefix for personal-org schema names (member/viewer get their own org)
+# Use underscores only: django-tenants schema_name validator allows [_a-zA-Z0-9] only
+PERSONAL_SCHEMA_PREFIX = "personal_"
 
 
 class KeycloakService:
@@ -254,6 +261,10 @@ class KeycloakService:
                 except Exception as e:
                     logger.warning(f"Failed to set password for existing user {username}: {e}")
             return uid
+        # Before create: if email already exists in Keycloak, do not create (avoids duplicate-email error)
+        if self.get_user_by_email(email):
+            logger.info(f"[Keycloak] User with email {email} already exists, skipping create")
+            return None
         try:
             # firstName and lastName are REQUIRED by the Keycloak user-profile
             # configuration; omitting them causes "Account is not fully set up" on ROPC.
@@ -298,8 +309,10 @@ class KeycloakService:
 
     def disable_user(self, user_id: str) -> bool:
         """Disable a Keycloak user account instead of deleting it.
-        Returns True on success, False otherwise."""
-        if not self.keycloak_admin or not user_id:
+        
+        This is preferred over deletion to preserve audit trails.
+        """
+        if not self.keycloak_admin:
             return False
         try:
             self.keycloak_admin.update_user(user_id, {"enabled": False})
@@ -307,6 +320,95 @@ class KeycloakService:
             return True
         except Exception as e:
             logger.error(f"Failed to disable user {user_id}: {e}")
+            return False
+
+    def create_invited_user(self, username: str, email: str, first_name: str = None, last_name: str = None):
+        """
+        Create a Keycloak user for invitation flow WITHOUT setting a password.
+        The user will set their password via Keycloak's email action.
+        
+        Returns user_id or None on failure.
+        """
+        if not self.keycloak_admin:
+            return None
+        
+        # Check if user already exists by email
+        existing = self.get_user_by_email(email)
+        if existing:
+            logger.info(f"[Keycloak] User with email {email} already exists")
+            return existing.get("id")
+        
+        # Check by username
+        existing_by_username = self.get_user_by_username(username)
+        if existing_by_username:
+            logger.info(f"[Keycloak] User with username {username} already exists")
+            return existing_by_username.get("id")
+        
+        try:
+            user_id = self.keycloak_admin.create_user({
+                "username": username,
+                "email": email,
+                "firstName": first_name or username,
+                "lastName": last_name or username,
+                "enabled": True,
+                "emailVerified": False,  # Will be verified when they set password
+                "requiredActions": ["UPDATE_PASSWORD", "VERIFY_EMAIL"],
+            })
+            logger.info(f"[Keycloak] Created invited user {username} (pending password setup)")
+            return user_id
+        except Exception as e:
+            logger.error(f"Failed to create invited user {username}: {e}")
+            return None
+
+    def send_execute_actions_email(self, user_id: str, actions: list = None, lifespan: int = 172800):
+        """
+        Send Keycloak's "Execute Actions" email to a user.
+        
+        This triggers Keycloak to send an email with a link for the user to complete
+        required actions like setting password or verifying email.
+        
+        Args:
+            user_id: Keycloak user ID
+            actions: List of actions e.g. ["UPDATE_PASSWORD", "VERIFY_EMAIL"]
+                     If None, uses the user's current requiredActions
+            lifespan: Link validity in seconds (default 48 hours = 172800)
+        
+        Returns:
+            True on success, False on failure
+        """
+        if not self.keycloak_admin:
+            return False
+        
+        if actions is None:
+            actions = ["UPDATE_PASSWORD"]
+        
+        try:
+            self.keycloak_admin.send_update_account(
+                user_id=user_id,
+                payload=actions,
+                lifespan=lifespan
+            )
+            logger.info(f"[Keycloak] Sent execute actions email to user {user_id}: {actions}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send execute actions email to user {user_id}: {e}")
+            return False
+
+    def send_verify_email(self, user_id: str):
+        """
+        Send email verification email to a user.
+        
+        Returns True on success, False on failure.
+        """
+        if not self.keycloak_admin:
+            return False
+        
+        try:
+            self.keycloak_admin.send_verify_email(user_id=user_id)
+            logger.info(f"[Keycloak] Sent verification email to user {user_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send verification email to user {user_id}: {e}")
             return False
 
     def enable_user(self, user_id: str) -> bool:
@@ -634,3 +736,122 @@ class KeycloakService:
         except Exception as e:
             logger.warning(f"Failed to remove client role {role_name} from user {user_id}: {e}")
             return False
+
+
+def create_personal_tenant_for_user(user, kc_user_id: str, keycloak: "KeycloakService"):
+    """
+    Create a personal organisation (tenant) for a user who was invited as MEMBER or VIEWER.
+    They become OWNER of this tenant and can invite others into it (B2).
+    Returns the created Client (tenant) or None on failure.
+    """
+    from django_tenants.utils import get_tenant_model
+    from customers.models import Client, Organization, TenantUser, Role, RolesMap
+
+    if not user or not kc_user_id or not keycloak or not keycloak.keycloak_admin:
+        return None
+
+    # Readable suffix from user email/username: personal_babyowner or personal_babyowner_2 if taken (no random hex)
+    import re
+    email_or_username = (getattr(user, "email", None) or user.username or "user").strip().lower()
+    if "@" in email_or_username:
+        base_part = email_or_username.split("@")[0]
+    else:
+        base_part = email_or_username
+    base_part = re.sub(r"[^a-z0-9]", "_", base_part).strip("_") or "user"
+    base_part = base_part[:25]
+
+    with schema_context("public"):
+        # Unique readable name: personal_babyowner, or personal_babyowner_2, ... if taken
+        schema_base = f"{PERSONAL_SCHEMA_PREFIX}{base_part}"
+        schema_name = schema_base
+        for n in range(1, 1000):
+            if not Client.objects.filter(schema_name=schema_name).exists():
+                break
+            schema_name = f"{schema_base}_{n}"
+        # Org name and Keycloak org name and client name all use the same readable pattern (e.g. personal_babyowner)
+        org_name = schema_name
+        client_id_name = schema_name
+
+        existing_client = Client.objects.filter(schema_name=schema_name).first()
+        if existing_client:
+            logger.warning(f"Personal tenant already exists for schema {schema_name}")
+            # Ensure Organisation record exists so it shows in admin/organisation list
+            if not existing_client.organization_id:
+                organization = Organization.objects.create(
+                    name=org_name,
+                    description=f"Personal organisation (backfill) for {existing_client.name}",
+                )
+                existing_client.organization = organization
+                existing_client.save(update_fields=["organization_id"])
+            return existing_client
+
+        try:
+            # Use same domain format as registration (name-suffix.com) so Keycloak accepts it
+            org_domain = f"{schema_name}-{uuid_module.uuid4().hex[:8]}.com"
+            kc_org_id = keycloak.create_organization(org_name, alias=org_name, domain=org_domain)
+            kc_client_id = keycloak.create_client(client_id_name)
+            if not kc_client_id:
+                for suffix in range(2, 50):
+                    kc_client_id = keycloak.create_client(f"{client_id_name}_{suffix}")
+                    if kc_client_id:
+                        break
+                if not kc_client_id:
+                    logger.warning("[Keycloak] create_client failed for personal org")
+
+            # Use a unique group name (UUID suffix) so we always get a new group id and avoid
+            # duplicate keycloak_group_id when many groups already exist
+            group_name = f"{schema_name}_{uuid_module.uuid4().hex[:12]}"
+            kc_group_id = keycloak.create_group(group_name)
+            if kc_group_id and Client.objects.filter(keycloak_group_id=kc_group_id).exists():
+                kc_group_id = None  # fallback: don't store duplicate
+            # Store None (not "") when no group so multiple tenants can have null (unique allows multiple NULLs)
+            group_id_for_db = kc_group_id if kc_group_id else None
+
+            with transaction.atomic():
+                organization = Organization.objects.create(
+                    name=org_name,
+                    description=f"Personal organisation for {user.username}",
+                )
+                tenant = Client.objects.create(
+                    schema_name=schema_name,
+                    name=org_name,
+                    organization=organization,
+                    keycloak_client_id=kc_client_id or "",
+                    keycloak_group_id=group_id_for_db,
+                )
+
+                if kc_org_id and org_name:
+                    try:
+                        keycloak.add_user_to_organization(kc_user_id, org_name)
+                    except Exception as e:
+                        logger.warning("Failed to add user to personal Keycloak org: %s", e)
+                if kc_group_id:
+                    try:
+                        keycloak.assign_user_to_client_role(kc_user_id, kc_group_id)
+                    except Exception as e:
+                        logger.warning("Failed to assign user to personal Keycloak group: %s", e)
+                if kc_client_id:
+                    try:
+                        keycloak.assign_client_role_to_user(kc_user_id, kc_client_id, "OWNER")
+                    except Exception as e:
+                        logger.warning("Failed to assign OWNER role for personal org: %s", e)
+
+                owner_role = Role.objects.get(name="OWNER")
+                TenantUser.objects.get_or_create(
+                    user=user,
+                    tenant=tenant,
+                    defaults={"role": owner_role.name},
+                )
+                role_id = keycloak.get_client_role_id(kc_client_id, "OWNER") if kc_client_id else None
+                RolesMap.objects.get_or_create(
+                    user=user,
+                    tenant=tenant,
+                    role=owner_role,
+                    defaults={"keycloak_role_id": role_id or ""},
+                )
+
+            logger.info(f"[Keycloak] Created personal org {org_name} for user {user.username}")
+            return tenant
+        except Exception as e:
+            logger.exception(f"Failed to create personal tenant for user {user.username}: {e}")
+            return None

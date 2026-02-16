@@ -284,4 +284,4 @@ This project is for educational and demonstration purposes.
 ## 👤 Author
 
 **Mokshitha Yeruva**  
-GitHub: [@Mokshitha-original](https://github.com/Mokshitha-original)
+GitHub: [@mokshitha-y](https://github.com/mokshitha-y)

@@ -1,7 +1,9 @@
 import os
 import django
 from prefect import flow, task, get_run_logger
+from prefect.context import get_run_context
 from datetime import datetime
+from typing import Optional
 
 # Setup Django configuration
 # This must be done before importing any Django models
@@ -9,14 +11,148 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "todo_saas.settings")
 django.setup()
 
 from django.db import transaction, connection
+from django.utils import timezone
 from django_tenants.utils import schema_context, get_tenant_model
 from users.models import User
 from todos.models import Todo
-from customers.models import Client, TenantUser, RolesMap, Organization
+from customers.models import (
+    Client,
+    TenantUser,
+    RolesMap,
+    Organization,
+    SystemAuditLog,
+    Invitation,
+    EmailConfiguration,
+)
 from customers.services import KeycloakService
 from todo_saas.utils.keycloak_admin import get_keycloak_admin_client
 
 Client = get_tenant_model()
+
+
+# ============================================
+# HELPER: GET PREFECT FLOW RUN ID
+# ============================================
+
+def get_flow_run_id() -> Optional[str]:
+    """Get current Prefect flow run ID if available."""
+    try:
+        ctx = get_run_context()
+        if ctx and ctx.flow_run:
+            return str(ctx.flow_run.id)
+    except Exception:
+        pass
+    return None
+
+
+# ============================================
+# HELPER: LOG TO SYSTEM AUDIT (PUBLIC SCHEMA)
+# ============================================
+
+def log_to_system_audit(
+    operation: str,
+    tenant_name: str,
+    schema_name: str = None,
+    status: str = "STARTED",
+    triggered_by: str = "system",
+    details: dict = None,
+    error_message: str = None,
+    started_at: datetime = None,
+    completed_at: datetime = None,
+) -> SystemAuditLog:
+    """
+    Create or update a SystemAuditLog entry in public schema.
+    Used for destructive operations that survive tenant deletion.
+    """
+    with schema_context("public"):
+        log = SystemAuditLog.objects.create(
+            operation=operation,
+            tenant_name=tenant_name,
+            schema_name=schema_name,
+            status=status,
+            triggered_by=triggered_by,
+            flow_run_id=get_flow_run_id(),
+            details=details,
+            error_message=error_message,
+            started_at=started_at or timezone.now(),
+            completed_at=completed_at,
+        )
+        return log
+
+
+def update_system_audit(
+    log_id: int,
+    status: str,
+    details: dict = None,
+    error_message: str = None,
+):
+    """Update an existing SystemAuditLog entry."""
+    with schema_context("public"):
+        SystemAuditLog.objects.filter(id=log_id).update(
+            status=status,
+            details=details,
+            error_message=error_message,
+            completed_at=timezone.now(),
+        )
+
+
+# ============================================
+# HELPER: LOG TO ORCHESTRATION LOG (TENANT SCHEMA)
+# ============================================
+
+def log_to_tenant(
+    schema_name: str,
+    flow_name: str,
+    status: str = "STARTED",
+    triggered_by: str = "system",
+    details: dict = None,
+    error_message: str = None,
+    started_at: datetime = None,
+    completed_at: datetime = None,
+) -> int:
+    """
+    Create OrchestrationLog entry in tenant schema.
+    Returns the log ID for later updates.
+    """
+    from report.models import OrchestrationLog
+    
+    try:
+        with schema_context(schema_name):
+            log = OrchestrationLog.objects.create(
+                flow_name=flow_name,
+                status=status,
+                flow_run_id=get_flow_run_id(),
+                triggered_by=triggered_by,
+                details=details,
+                error_message=error_message,
+                started_at=started_at or timezone.now(),
+                completed_at=completed_at,
+            )
+            return log.id
+    except Exception:
+        return None
+
+
+def update_tenant_log(
+    schema_name: str,
+    log_id: int,
+    status: str,
+    details: dict = None,
+    error_message: str = None,
+):
+    """Update an existing OrchestrationLog entry in tenant schema."""
+    from report.models import OrchestrationLog
+    
+    try:
+        with schema_context(schema_name):
+            OrchestrationLog.objects.filter(id=log_id).update(
+                status=status,
+                details=details,
+                error_message=error_message,
+                completed_at=timezone.now(),
+            )
+    except Exception:
+        pass
 
 
 # ============================================
@@ -106,7 +242,7 @@ def count_invited_users(tenant_id: int):
 @task(retries=2)
 def store_dashboard_metrics(metrics_list: list):
     """
-    Store aggregated metrics in report table (public schema).
+    Store aggregated metrics in each tenant's schema.
     
     Args:
         metrics_list: List of metric dicts from all tenants
@@ -116,35 +252,37 @@ def store_dashboard_metrics(metrics_list: list):
     try:
         from report.models import DashboardMetrics
         
-        with schema_context("public"):
-            for metrics in metrics_list:
-                # Get the tenant object by schema_name
-                try:
-                    tenant = Client.objects.get(schema_name=metrics["schema_name"])
-                except Client.DoesNotExist:
-                    logger.warning(f"Tenant not found for schema: {metrics['schema_name']}")
-                    continue
-                
-                # Upsert: delete old, insert new
-                # DashboardMetrics uses: tenant, todos_new, todos_completed, total_users
-                DashboardMetrics.objects.filter(tenant=tenant).delete()
-                
-                DashboardMetrics.objects.create(
-                    tenant=tenant,
-                    todos_new=metrics["new_todos"],
-                    todos_completed=metrics["completed_todos"],
-                    total_users=metrics.get("total_users", 0),  # Will be updated by Job A
-                )
+        stored_count = 0
+        for metrics in metrics_list:
+            schema_name = metrics.get("schema_name")
+            if not schema_name or schema_name == "public":
+                continue
+            
+            try:
+                with schema_context(schema_name):
+                    # Upsert: delete old, insert new (single row per tenant)
+                    DashboardMetrics.objects.all().delete()
+                    
+                    DashboardMetrics.objects.create(
+                        todos_new=metrics.get("new_todos", 0),
+                        todos_completed=metrics.get("completed_todos", 0),
+                        todos_deleted=metrics.get("deleted_todos", 0),
+                        total_todos=metrics.get("total_todos", 0),
+                        total_users=metrics.get("total_users", 0),
+                    )
+                    stored_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to store metrics for {schema_name}: {e}")
         
-        logger.info(f"Stored {len(metrics_list)} metric records")
-        return len(metrics_list)
+        logger.info(f"Stored metrics in {stored_count} tenant schema(s)")
+        return stored_count
     except Exception as e:
         logger.error(f"Failed to store dashboard metrics: {e}", exc_info=True)
         raise
 
 
 @flow(name="Dashboard Aggregation")
-def dashboard_aggregation_flow():
+def dashboard_aggregation_flow(triggered_by: str = "system"):
     """
     Aggregate dashboard metrics across all tenants.
 
@@ -155,14 +293,29 @@ def dashboard_aggregation_flow():
     1. Iterate through all active tenants
     2. Fetch metrics for each tenant schema
     3. Count invited users per tenant
-    4. Store results in DashboardMetrics table
+    4. Store results in DashboardMetrics table (per-tenant)
+    5. Log to OrchestrationLog in each tenant schema
     """
     logger = get_run_logger()
     logger.info("Starting dashboard aggregation flow")
+    
+    start_time = timezone.now()
+    tenant_logs = {}  # schema_name -> log_id
 
     try:
         with schema_context("public"):
             active_tenants = list(Client.objects.filter(on_trial=True))
+        
+        # Log start in each tenant's OrchestrationLog
+        for tenant in active_tenants:
+            log_id = log_to_tenant(
+                schema_name=tenant.schema_name,
+                flow_name="DASHBOARD_AGGREGATION",
+                status="STARTED",
+                triggered_by=triggered_by,
+                started_at=start_time,
+            )
+            tenant_logs[tenant.schema_name] = log_id
 
         # Fetch schema metrics (sequential — works both direct-call and worker)
         metrics_list = []
@@ -187,6 +340,26 @@ def dashboard_aggregation_flow():
 
         # Store all metrics
         store_dashboard_metrics(metrics_list)
+        
+        # Update logs in each tenant
+        for tenant in active_tenants:
+            log_id = tenant_logs.get(tenant.schema_name)
+            if log_id:
+                # Find this tenant's metrics
+                tenant_metrics = next(
+                    (m for m in metrics_list if m["schema_name"] == tenant.schema_name),
+                    {}
+                )
+                update_tenant_log(
+                    schema_name=tenant.schema_name,
+                    log_id=log_id,
+                    status="COMPLETED",
+                    details={
+                        "todos_new": tenant_metrics.get("new_todos", 0),
+                        "todos_completed": tenant_metrics.get("completed_todos", 0),
+                        "total_users": tenant_metrics.get("total_users", 0),
+                    },
+                )
 
         logger.info(
             f"Dashboard aggregation completed: "
@@ -203,6 +376,15 @@ def dashboard_aggregation_flow():
 
     except Exception as e:
         logger.error(f"Dashboard aggregation flow failed: {e}")
+        # Update logs as failed
+        for schema_name, log_id in tenant_logs.items():
+            if log_id:
+                update_tenant_log(
+                    schema_name=schema_name,
+                    log_id=log_id,
+                    status="FAILED",
+                    error_message=str(e),
+                )
         raise
 
 
@@ -250,11 +432,15 @@ def delete_tenant_schema(schema_name: str):
 @task(retries=2)
 def delete_local_tenant_data(tenant_id: int):
     """
-    Delete tenant metadata from public schema (Client, TenantUser, RolesMap,
-    Organization) and return the list of orphaned user IDs.
+    Delete all tenant metadata from public schema for this org: TenantUser,
+    RolesMap, Invitation, EmailConfiguration, Client, Organization.
+    Returns the list of orphaned user IDs.
 
     Orphan users are NOT deleted here because the tenant schema (which contains
     todos_todo with FK constraints to users_user) must be dropped first.
+    
+    Also identifies globally orphaned disabled users (users who were previously
+    removed from tenants and have is_active=False with 0 memberships).
     """
     logger = get_run_logger()
 
@@ -265,6 +451,7 @@ def delete_local_tenant_data(tenant_id: int):
             with transaction.atomic():
                 tenant = Client.objects.get(id=tenant_id)
                 schema_name = tenant.schema_name
+                organization = tenant.organization
 
                 # Capture user ids that are associated with this tenant so we can
                 # determine which become orphans after we remove TenantUser rows.
@@ -272,31 +459,44 @@ def delete_local_tenant_data(tenant_id: int):
                     TenantUser.objects.filter(tenant=tenant).values_list("user_id", flat=True)
                 )
 
-                # Delete related mappings
+                # Delete all tenant-related data (order matters: dependents first)
                 TenantUser.objects.filter(tenant=tenant).delete()
                 RolesMap.objects.filter(tenant=tenant).delete()
+                Invitation.objects.filter(tenant=tenant).delete()
+                EmailConfiguration.objects.filter(tenant=tenant).delete()
 
-                # Delete organization
-                if tenant.organization:
-                    tenant.organization.delete()
-
-                # Delete tenant itself
+                # Delete tenant (Client) then organization
                 tenant.delete()
+                if organization:
+                    organization.delete()
 
-                # Identify orphan users (no remaining tenant memberships)
-                orphan_user_ids = list(
+                # Identify orphan users from THIS tenant (no remaining tenant memberships)
+                new_orphan_ids = list(
                     User.objects.filter(id__in=associated_user_ids)
                     .annotate(tenant_count=Count("tenant_memberships"))
                     .filter(tenant_count=0)
                     .values_list("id", flat=True)
                 )
 
-                logger.info(
-                    f"Deleted local tenant data for {schema_name} (ID: {tenant_id}), "
-                    f"orphan_user_ids={orphan_user_ids}"
+                # Also find globally orphaned disabled users (previously removed members
+                # who have is_active=False and 0 tenant memberships anywhere)
+                stale_orphan_ids = list(
+                    User.objects.filter(is_active=False)
+                    .annotate(tenant_count=Count("tenant_memberships"))
+                    .filter(tenant_count=0)
+                    .values_list("id", flat=True)
                 )
 
-        return {"schema_name": schema_name, "orphan_user_ids": orphan_user_ids}
+                # Combine both lists (deduplicated)
+                all_orphan_ids = list(set(new_orphan_ids) | set(stale_orphan_ids))
+
+                logger.info(
+                    f"Deleted local tenant data for {schema_name} (ID: {tenant_id}), "
+                    f"new_orphans={new_orphan_ids}, stale_orphans={stale_orphan_ids}, "
+                    f"total_orphans={len(all_orphan_ids)}"
+                )
+
+        return {"schema_name": schema_name, "orphan_user_ids": all_orphan_ids}
     except Exception as e:
         logger.error(f"Failed to delete local tenant data for {tenant_id}: {e}")
         raise
@@ -329,6 +529,44 @@ def delete_orphan_users(orphan_user_ids: list):
     except Exception as e:
         logger.error(f"Failed to delete orphan users {orphan_user_ids}: {e}")
         raise
+
+
+@task(retries=1)
+def delete_stale_orphan_keycloak_users(orphan_user_ids: list):
+    """
+    Delete stale orphan users from Keycloak.
+    
+    These are users who were previously removed from tenants (disabled) and
+    are now being permanently deleted. They weren't in the current tenant's
+    TenantUser list, so we need to look them up by ID and delete from KC.
+    """
+    logger = get_run_logger()
+
+    if not orphan_user_ids:
+        return 0
+
+    deleted_count = 0
+    try:
+        kc = get_keycloak_admin_client()
+        
+        with schema_context("public"):
+            orphan_users = User.objects.filter(id__in=orphan_user_ids, keycloak_id__isnull=False)
+            
+            for user in orphan_users:
+                try:
+                    kc.delete_user(user.keycloak_id)
+                    deleted_count += 1
+                    logger.info(f"Deleted stale orphan from Keycloak: {user.username} ({user.keycloak_id})")
+                except Exception as e:
+                    # User may already be deleted from Keycloak, continue
+                    logger.warning(f"Failed to delete {user.username} from Keycloak: {e}")
+        
+        logger.info(f"Deleted {deleted_count} stale orphan users from Keycloak")
+        return deleted_count
+    except Exception as e:
+        logger.error(f"Failed to delete stale orphan Keycloak users: {e}")
+        # Don't fail the flow, just log the error
+        return deleted_count
 
 
 @task(retries=1)
@@ -444,26 +682,70 @@ def delete_keycloak_organization(org_name: str):
         logger.warning(f"Failed to delete Keycloak organization {org_name}: {e}")
         return False
 
+
+@task(retries=1)
+def cleanup_tenant_invitations(tenant_id: int):
+    """
+    Cancel all pending invitations for a tenant and clean up KC users
+    created by those invitations who have no other tenant memberships.
+    
+    Returns dict with counts and details.
+    """
+    logger = get_run_logger()
+    
+    try:
+        with schema_context("public"):
+            # Get all invitations for this tenant
+            invitations = Invitation.objects.filter(tenant_id=tenant_id)
+            total_invitations = invitations.count()
+            pending_count = invitations.filter(status="PENDING").count()
+            
+            # Cancel all pending invitations
+            cancelled = invitations.filter(status="PENDING").update(status="CANCELLED")
+            
+            logger.info(
+                f"Invitation cleanup: total={total_invitations}, "
+                f"pending_cancelled={cancelled}"
+            )
+            
+            return {
+                "total_invitations": total_invitations,
+                "pending_cancelled": cancelled,
+            }
+    except Exception as e:
+        logger.warning(f"Failed to cleanup invitations for tenant {tenant_id}: {e}")
+        return {"total_invitations": 0, "pending_cancelled": 0}
+
 @flow(name="Account Deletion")
-def account_deletion_flow(tenant_id: int):
+def account_deletion_flow(tenant_id: int, triggered_by: str = "system"):
     """
     Orchestrate end-to-end PERMANENT deletion of a tenant account.
 
-    Tracked as a Prefect flow run — visible in Prefect dashboard.
+    When the owner clicks "Delete account", everything for that org is dropped:
+    - Schema: PostgreSQL tenant schema (DROP SCHEMA ... CASCADE) — all tenant
+      tables (todos, etc.) are removed.
+    - Org: Keycloak organisation and Django Organization record.
+    - Client: Keycloak client (OAuth2 app) and Django Client (tenant) record.
+    - Users: Keycloak users in that org (permanently deleted if no other
+      tenant); Django TenantUser/RolesMap/Invitation/EmailConfiguration;
+      orphan Django users removed after schema drop.
 
-    Execution steps:
-    1. Fetch tenant and user data
-    2. Clean up Keycloak users (permanent delete for orphans, cleanup for shared)
-    3. Delete Keycloak group, client, organization
-    4. Delete Django data (metrics, mappings, org, tenant)
-    5. Drop PostgreSQL schema
+    Also: Keycloak group, cancelled invitations, and stale orphan users.
+
+    Tracked as a Prefect flow run — visible in Prefect dashboard.
+    Logs to SystemAuditLog (public schema) - survives tenant deletion.
     """
     logger = get_run_logger()
     logger.info(f"Starting account deletion flow for tenant {tenant_id}")
+    
+    start_time = timezone.now()
+    audit_log = None
+    schema_name = None
+    org_name = None
 
     try:
         # =====================
-        # STEP 1: FETCH ALL DATA
+        # STEP 1: FETCH ALL DATA (tenant, users, invitations)
         # =====================
         with schema_context("public"):
             tenant = Client.objects.get(id=tenant_id)
@@ -472,25 +754,59 @@ def account_deletion_flow(tenant_id: int):
             keycloak_group_id = tenant.keycloak_group_id
             keycloak_client_id = tenant.keycloak_client_id
 
+            # ALL users in this tenant (owner + all invited members)
             tenant_user_objs = list(
                 TenantUser.objects.filter(tenant=tenant).select_related("user")
             )
 
+            # Count invitations for audit
+            invitation_count = Invitation.objects.filter(tenant=tenant).count()
+            pending_invitation_count = Invitation.objects.filter(
+                tenant=tenant, status="PENDING"
+            ).count()
+        
+        # Log start to SystemAuditLog (public)
+        audit_log = log_to_system_audit(
+            operation="TENANT_DELETED",
+            tenant_name=org_name,
+            schema_name=schema_name,
+            status="STARTED",
+            triggered_by=triggered_by,
+            details={
+                "user_count": len(tenant_user_objs),
+                "invitation_count": invitation_count,
+                "pending_invitations": pending_invitation_count,
+            },
+            started_at=start_time,
+        )
+
         logger.info(
             f"Tenant data: schema={schema_name}, org={org_name}, "
             f"client_id={keycloak_client_id}, group_id={keycloak_group_id}, "
-            f"users={len(tenant_user_objs)}"
+            f"users={len(tenant_user_objs)}, invitations={invitation_count}"
         )
 
         # =====================
-        # STEP 2: KEYCLOAK USER CLEANUP
+        # STEP 2: KEYCLOAK USER CLEANUP (owner + ALL invited members)
+        # Every user in this tenant gets cleaned up from KC:
+        # - Tokens revoked
+        # - Removed from KC org, client role, group
+        # - Permanently DELETED from KC if they have no other tenants
+        # - Just cleaned up (not deleted) if they belong to other tenants
         # =====================
         deleted_users = []
         kept_users = []
 
+        logger.info(
+            f"Cleaning up {len(tenant_user_objs)} KC users "
+            f"(owner + all invited members)"
+        )
+
         for tu in tenant_user_objs:
             user = tu.user
             if not user.keycloak_id:
+                logger.warning(f"User {user.username} has no keycloak_id, skipping KC cleanup")
+                deleted_users.append(user.username)  # Still count as deleted locally
                 continue
 
             other_tenants = TenantUser.objects.filter(
@@ -514,11 +830,21 @@ def account_deletion_flow(tenant_id: int):
                 kept_users.append(user.username)
 
         logger.info(
-            f"KC user cleanup done: deleted={deleted_users}, kept={kept_users}"
+            f"KC user cleanup done: "
+            f"permanently_deleted={deleted_users}, "
+            f"cleaned_up_kept={kept_users}"
         )
 
         # =====================
-        # STEP 3: DELETE KC GROUP / CLIENT / ORG
+        # STEP 3: CANCEL ALL INVITATIONS
+        # Cancel pending invitations so they cannot be used after deletion.
+        # Invitation records will be cascade-deleted when Client is deleted.
+        # =====================
+        invitation_result = cleanup_tenant_invitations(tenant_id)
+
+        # =====================
+        # STEP 4: DELETE KC GROUP / CLIENT / ORG
+        # Remove all Keycloak resources for this tenant
         # =====================
         if keycloak_group_id:
             delete_keycloak_group(keycloak_group_id)
@@ -530,14 +856,15 @@ def account_deletion_flow(tenant_id: int):
             delete_keycloak_organization(org_name)
 
         # =====================
-        # STEP 4: DELETE DJANGO DATA (Client, TenantUser, Organization)
-        # Returns orphan_user_ids for cleanup after schema drop
+        # STEP 5: DELETE DJANGO DATA (Client, TenantUser, Organization, Invitations)
+        # Invitations cascade-delete via FK to Client.
+        # Returns orphan_user_ids for cleanup after schema drop.
         # =====================
         local_result = delete_local_tenant_data(tenant_id)
         orphan_user_ids = local_result.get("orphan_user_ids", [])
 
         # =====================
-        # STEP 5: DROP SCHEMA
+        # STEP 6: DROP SCHEMA
         # Must happen BEFORE deleting orphan users because tenant-scoped
         # tables (todos_todo) have FK constraints to users_user.
         # Dropping the schema removes those constraints.
@@ -545,9 +872,33 @@ def account_deletion_flow(tenant_id: int):
         delete_tenant_schema(schema_name)
 
         # =====================
-        # STEP 6: DELETE ORPHAN USERS (safe now that schema is gone)
+        # STEP 7: DELETE ORPHAN USERS FROM KEYCLOAK
+        # Delete stale orphan users from Keycloak (they weren't in tenant_user_objs
+        # because they were previously removed/disabled)
+        # =====================
+        stale_kc_deleted = delete_stale_orphan_keycloak_users(orphan_user_ids)
+
+        # =====================
+        # STEP 8: DELETE ORPHAN USERS FROM DATABASE (safe now that schema is gone)
         # =====================
         delete_orphan_users(orphan_user_ids)
+        
+        # =====================
+        # STEP 9: UPDATE AUDIT LOG
+        # =====================
+        if audit_log:
+            update_system_audit(
+                log_id=audit_log.id,
+                status="COMPLETED",
+                details={
+                    "users_deleted": deleted_users,
+                    "users_kept": kept_users,
+                    "orphan_users_deleted": len(orphan_user_ids),
+                    "stale_kc_users_deleted": stale_kc_deleted,
+                    "invitations_cancelled": invitation_result.get("pending_cancelled", 0),
+                    "total_invitations_deleted": invitation_result.get("total_invitations", 0),
+                },
+            )
 
         logger.info(f"Account deletion COMPLETED for tenant {tenant_id} ({schema_name})")
 
@@ -562,6 +913,13 @@ def account_deletion_flow(tenant_id: int):
         }
     except Exception as e:
         logger.error(f"Account deletion flow FAILED for tenant {tenant_id}: {e}")
+        # Update audit log as failed
+        if audit_log:
+            update_system_audit(
+                log_id=audit_log.id,
+                status="FAILED",
+                error_message=str(e),
+            )
         raise
 
 
@@ -674,19 +1032,24 @@ def create_recurring_instance(schema_name: str, todo_data: dict):
 
 
 @flow(name="Recurring Todo Processing")
-def recurring_todo_flow():
+def recurring_todo_flow(triggered_by: str = "system"):
     """
     Process recurring todos across all tenants.
 
     Tracked as a Prefect flow run — visible in Prefect dashboard.
     Called directly by API and by scheduled deployment.
+    Logs to OrchestrationLog in each tenant schema.
 
     Execution steps:
     1. Iterate through all active tenants
     2. Find todos with recurrence settings that are completed
     3. Create new todo instances with updated due dates
+    4. Log to each tenant's OrchestrationLog
     """
     logger = get_run_logger()
+    
+    start_time = timezone.now()
+    tenant_logs = {}  # schema_name -> (log_id, todos_created)
 
     try:
         with schema_context("public"):
@@ -694,15 +1057,40 @@ def recurring_todo_flow():
             tenant_list = [(t.id, t.schema_name) for t in active_tenants]
 
         logger.info(f"Processing recurring todos for {len(tenant_list)} tenant(s)")
+        
+        # Log start in each tenant
+        for tenant_id, schema_name in tenant_list:
+            log_id = log_to_tenant(
+                schema_name=schema_name,
+                flow_name="RECURRING_TODO",
+                status="STARTED",
+                triggered_by=triggered_by,
+                started_at=start_time,
+            )
+            tenant_logs[schema_name] = {"log_id": log_id, "todos_created": 0}
 
         total_created = 0
         for tenant_id, schema_name in tenant_list:
             recurring_todos = find_recurring_todos(schema_name)
+            tenant_created = 0
 
             for todo_data in recurring_todos:
                 result = create_recurring_instance(schema_name, todo_data)
                 if result is not None:
                     total_created += 1
+                    tenant_created += 1
+            
+            tenant_logs[schema_name]["todos_created"] = tenant_created
+        
+        # Update logs in each tenant
+        for schema_name, data in tenant_logs.items():
+            if data["log_id"]:
+                update_tenant_log(
+                    schema_name=schema_name,
+                    log_id=data["log_id"],
+                    status="COMPLETED",
+                    details={"todos_created": data["todos_created"]},
+                )
 
         logger.info(f"Recurring todo processing complete. Created {total_created} new instances.")
 
@@ -715,5 +1103,14 @@ def recurring_todo_flow():
         }
     except Exception as e:
         logger.error(f"Recurring todo flow failed: {e}")
+        # Update logs as failed
+        for schema_name, data in tenant_logs.items():
+            if data.get("log_id"):
+                update_tenant_log(
+                    schema_name=schema_name,
+                    log_id=data["log_id"],
+                    status="FAILED",
+                    error_message=str(e),
+                )
         raise
 

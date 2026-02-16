@@ -23,10 +23,9 @@ ALLOWED_HOSTS = [
 
 SHARED_APPS = (
     "django_tenants",
-    "customers",          # tenants + tenant-user mapping
+    "customers",          # tenants + tenant-user mapping + SystemAuditLog
     "users",              # ✅ USERS IN PUBLIC SCHEMA
     "orchestration",      # ✅ Prefect workflow orchestration
-    "report",             # ✅ Aggregated reports
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -37,6 +36,7 @@ SHARED_APPS = (
 
 TENANT_APPS = (
     "todos",              # ✅ TENANT-ISOLATED DATA ONLY
+    "report",             # ✅ DashboardMetrics + OrchestrationLog (per-tenant)
     "simple_history",
 )
 
@@ -46,7 +46,7 @@ INSTALLED_APPS = (
     + [
         "rest_framework",
         "corsheaders",
-        "rest_framework.authtoken",
+        # "rest_framework.authtoken" - Removed: Using Keycloak for auth
     ]
 )
 
@@ -326,3 +326,34 @@ LOGGING = {
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
+
+
+# ============================
+# EMAIL CONFIGURATION
+# ============================
+
+# Check if SMTP credentials are provided
+_email_user = os.environ.get('EMAIL_HOST_USER', '')
+_email_password = os.environ.get('EMAIL_HOST_PASSWORD', '')
+
+if _email_user and _email_password:
+    # Production: SMTP backend (real emails)
+    EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
+else:
+    # Development: Console backend (prints to terminal)
+    EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
+
+EMAIL_HOST = os.environ.get('EMAIL_HOST', 'smtp.gmail.com')
+EMAIL_PORT = int(os.environ.get('EMAIL_PORT', 587))
+EMAIL_USE_TLS = True
+EMAIL_HOST_USER = _email_user
+EMAIL_HOST_PASSWORD = _email_password
+
+# Default "from" email
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@todosaas.com')
+
+# Frontend URL for invitation links
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://localhost:3000')
+
+# Invitation expiry in hours
+INVITATION_EXPIRY_HOURS = 48
